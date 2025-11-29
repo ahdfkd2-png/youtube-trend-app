@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple
 
 import pandas as pd
 from googleapiclient.discovery import build
-from googleapient.errors import HttpError
+from googleapiclient.errors import HttpError
 
 
 # ----------------------------
