@@ -1,3 +1,18 @@
+import streamlit as st
+
+# ---------------------------
+# UI 기본 틀 (대시보드 헤더 + 메뉴)
+# ---------------------------
+
+# 화면 상단 큰 제목
+st.markdown("<h1 style='text-align:center;'>📊 YouTube Analytics Dashboard</h1>", unsafe_allow_html=True)
+
+# 좌측 메뉴
+menu = st.sidebar.radio(
+    "📁 메뉴 선택",
+    ["Dashboard 홈", "채널 분석", "영상 분석", "SEO 분석", "경쟁 채널"]
+)
+
 import re
 from collections import Counter
 from datetime import datetime, timezone
