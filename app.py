@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple
 
 import pandas as pd
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from googleapient.errors import HttpError
 
 
 # ----------------------------
@@ -16,7 +16,7 @@ from googleapiclient.errors import HttpError
 # ----------------------------
 
 st.set_page_config(
-    page_title="YouTube 트렌드·채널 분석기 (v4.0 - UPGRADED)",
+    page_title="YouTube 트렌드·채널 분석기 (v5.0 - FINAL)",
     page_icon="📊",
     layout="wide",
 )
@@ -661,7 +661,7 @@ def page_single_channel(api_key: str, video_limit: int):
 
     render_top_thumbnails(df)
     render_pattern_charts(df)
-    render_keyword_suggestions(df) # UPGRADE: 성과 가중치 적용
+    render_keyword_suggestions(df)
     render_video_table(df)
 
 
@@ -716,49 +716,60 @@ def page_channel_history():
 
 
 def page_competitive_channels(api_key: str, video_limit: int):
-    # (기존 코드와 동일하게 유지)
+    """UPGRADE: 5단계 - 히스토리 기반으로 경쟁 채널을 선택하고 벤치마킹"""
     st.title("🎯 경쟁 채널 벤치마킹")
-    st.markdown("##### 비슷한 주제의 채널 여러 개를 비교하여 벤치마킹합니다.")
+    st.markdown("##### 히스토리에 저장된 채널들을 비교하여 벤치마킹합니다.")
 
-    st.write(
-        "비슷한 주제의 채널 여러 개를 넣어두고, 최근 영상 성과를 간단히 비교해볼 수 있습니다.\n"
-        "각 줄에 하나씩 채널 ID 또는 URL 을 적어 주세요."
+    history_data = load_channel_history()
+    
+    if not history_data:
+        st.info("비교할 채널이 없습니다. '특정 채널 심층 분석' 페이지에서 채널을 분석하고 저장해 주세요.")
+        return
+
+    channel_options = {
+        data['title']: data['channel_id']
+        for data in history_data.values()
+    }
+    
+    selected_titles = st.multiselect(
+        "🔎 비교할 채널을 선택하세요 (최소 2개)",
+        options=list(channel_options.keys()),
+        default=list(channel_options.keys())[:2],
+        key="comp_select"
     )
 
-    raw = st.text_area(
-        "채널 ID / URL 목록 (한 줄에 하나씩)",
-        height=150,
-        placeholder="예)\nhttps://www.youtube.com/channel/UCxxxxxxxxxx1\nhttps://www.youtube.com/channel/UCxxxxxxxxxx2",
-        key="comp_input"
-    )
+    if len(selected_titles) < 2:
+        st.warning("비교 분석을 위해 최소 2개 이상의 채널을 선택해야 합니다.")
+        return
 
-    if not raw.strip(): st.info("채널 목록을 입력해 주세요."); return
-
-    lines = [extract_channel_id(line) for line in raw.splitlines() if line.strip()]
-    lines = list(dict.fromkeys(lines))
-
-    if len(lines) < 2: st.info("최소 2개 이상의 채널을 입력해 주세요."); return
+    selected_ids = [channel_options[title] for title in selected_titles]
 
     if st.button("📊 경쟁 채널 비교 실행", type="primary"):
-        rows = []; error_channels = []
+        rows = []
+        error_channels = []
 
-        for cid in lines:
+        for title, cid in zip(selected_titles, selected_ids):
             try:
-                with st.spinner(f"채널 {cid} 분석 중..."):
+                with st.spinner(f"채널 '{title}' 분석 중..."):
                     info = fetch_channel_basic(api_key, cid)
                     df = fetch_channel_recent_videos(api_key, cid, video_limit)
             except HttpError as e:
                 msg = str(e)
-                if "quotaExceeded" in msg: st.error("❌ YouTube API 일일 할당량이 초과되었습니다. 더 이상 채널을 분석할 수 없습니다."); return
-                else: error_channels.append(f"{cid} (오류: {msg})"); continue
+                if "quotaExceeded" in msg:
+                    st.error("❌ YouTube API 일일 할당량이 초과되었습니다. 더 이상 채널을 분석할 수 없습니다."); return
+                else:
+                    error_channels.append(f"{title} (ID: {cid}, 오류: {msg})"); continue
 
-            if not info or df.empty: error_channels.append(f"{cid} (데이터 없음)"); continue
+            if not info or df.empty:
+                error_channels.append(f"{title} (ID: {cid}, 데이터 부족)"); continue
 
             row = {
                 "채널명": info["title"], "채널ID": info["channel_id"],
                 "구독자 수": info["subscriber_count"], "총 조회수": info["view_count"], "총 업로드 수": info["video_count"],
-                "최근 영상 수(분석)": len(df), "최근 평균 조회수": int(df["views"].mean()),
-                "최근 중앙값 조회수": int(df["views"].median()), "최근 최고 조회수": int(df["views"].max()),
+                "최근 영상 수(분석)": len(df), 
+                "최근 평균 조회수": int(df["views"].mean()),
+                "최근 중앙값 조회수": int(df["views"].median()), 
+                "최근 최고 조회수": int(df["views"].max()),
                 "최근 평균 길이(분)": round(df["duration_min"].mean(), 1),
                 "최근 일 평균 조회수(평균)": int(df["views_per_day"].mean()),
             }
@@ -770,6 +781,7 @@ def page_competitive_channels(api_key: str, video_limit: int):
             return
 
         result_df = pd.DataFrame(rows)
+        
         st.subheader("🏁 경쟁 채널 요약 비교 테이블")
         st.dataframe(result_df, use_container_width=True, hide_index=True)
 
