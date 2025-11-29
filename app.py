@@ -1,5 +1,7 @@
 import streamlit as st
 import re
+import os
+import json
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Tuple
@@ -73,7 +75,7 @@ def weekday_kr_from_ts(ts: pd.Timestamp) -> str:
 
 
 def extract_channel_id(raw: str) -> str:
-    """사용자가 입력한 값에서 channelId 추출 (기존 로직 유지)"""
+    """사용자가 입력한 값에서 channelId 추출"""
     raw = raw.strip()
     if "youtube.com/channel/" in raw:
         return raw.split("youtube.com/channel/")[-1].split("/")[0].split("?")[0]
@@ -90,7 +92,6 @@ def safe_int(x):
         return 0
 
 
-# --- 새로운 유틸리티 함수: 천 단위 포맷팅 ---
 def format_korean_unit(number):
     """숫자를 한국어 단위(만, 억)로 포맷팅"""
     if number >= 100000000:
@@ -100,73 +101,129 @@ def format_korean_unit(number):
     else:
         return f"{number:,}"
 
+# --- UPGRADE: 3단계 - 히스토리 저장/로드 및 등급 부여 함수 추가 ---
+
+HISTORY_FILE = "channel_history.json"
+
+
+def save_channel_history(history_data: Dict):
+    """채널 히스토리 데이터를 JSON 파일에 저장"""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history_data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        st.error(f"❌ 히스토리 저장 실패: {e}")
+
+
+def load_channel_history() -> Dict:
+    """JSON 파일에서 채널 히스토리 데이터를 불러오기"""
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def assign_channel_grade(info: Dict, recent_df: pd.DataFrame) -> str:
+    """채널 등급 (A1~C3)을 부여하는 간단한 로직"""
+    if recent_df.empty or info['subscriber_count'] == 0:
+        return "등급 외"
+
+    # 1. 규모 점수 (구독자 수) - 40%
+    sub_count = info['subscriber_count']
+    if sub_count >= 100000: rank_sub = 3
+    elif sub_count >= 10000: rank_sub = 2
+    else: rank_sub = 1
+    
+    # 2. 활동 점수 (일 평균 조회수) - 60%
+    avg_daily_views = recent_df['views_per_day'].mean()
+    if sub_count > 0:
+        daily_ratio = avg_daily_views / sub_count * 1000
+    else:
+        daily_ratio = 0
+        
+    if daily_ratio >= 10: rank_activity = 3
+    elif daily_ratio >= 3: rank_activity = 2
+    else: rank_activity = 1
+    
+    final_score = (rank_sub * 0.4 + rank_activity * 0.6)
+    
+    if final_score >= 2.6: grade_char = 'A'
+    elif final_score >= 1.8: grade_char = 'B'
+    else: grade_char = 'C'
+        
+    grade_num = 1
+    if sub_count < 10000: grade_num = 3
+    elif sub_count < 50000 and daily_ratio < 5: grade_num = 2 
+    elif sub_count >= 100000 and daily_ratio >= 10: grade_num = 1
+        
+    return f"{grade_char}{grade_num}"
+
+
+def get_channel_summary_row(info: Dict, df: pd.DataFrame) -> Dict:
+    """채널 히스토리에 저장할 핵심 데이터 요약"""
+    if df.empty:
+        return {}
+        
+    now = datetime.now(timezone.utc)
+    recent_30d = df[df["published_at"] > (now - timedelta(days=30))]
+
+    row = {
+        "channel_id": info["channel_id"],
+        "title": info["title"],
+        "subscriber_count": info["subscriber_count"],
+        "total_views": info["view_count"],
+        "video_count": info["video_count"],
+        "analysis_date": now.strftime('%Y-%m-%d %H:%M'),
+        "recent_video_count": len(df),
+        "recent_avg_views": int(df["views"].mean()),
+        "recent_avg_daily_views": int(df["views_per_day"].mean()),
+        "videos_last_30d": len(recent_30d),
+        "grade": assign_channel_grade(info, df)
+    }
+    return row
 
 # ----------------------------
-# 데이터 가져오기 (캐시 적용) - 기존 함수 그대로 사용 (최적화 완료)
+# 데이터 가져오기 (캐시 적용)
 # ----------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_videos_by_keyword(api_key: str, keyword: str, max_results: int) -> pd.DataFrame:
     # (기존 코드와 동일하게 유지)
     youtube = build_youtube(api_key)
-
-    # search.list (max 50)
     max_results = max(1, min(max_results, 50))
     search_resp = youtube.search().list(
-        part="snippet",
-        q=keyword,
-        type="video",
-        order="relevance",
-        maxResults=max_results,
+        part="snippet", q=keyword, type="video", order="relevance", maxResults=max_results,
     ).execute()
 
     video_ids = [item["id"]["videoId"] for item in search_resp.get("items", [])]
-    if not video_ids:
-        return pd.DataFrame()
+    if not video_ids: return pd.DataFrame()
 
-    # videos.list (최적화 - 50개 묶음 1회 호출)
     videos_resp = youtube.videos().list(
-        part="snippet,contentDetails,statistics",
-        id=",".join(video_ids),
-        maxResults=len(video_ids),
+        part="snippet,contentDetails,statistics", id=",".join(video_ids), maxResults=len(video_ids),
     ).execute()
 
     rows = []
     for item in videos_resp.get("items", []):
-        snippet = item.get("snippet", {})
-        stats = item.get("statistics", {})
-        content = item.get("contentDetails", {})
-
+        snippet = item.get("snippet", {}); stats = item.get("statistics", {}); content = item.get("contentDetails", {})
         published_at = snippet.get("publishedAt")
-        try:
-            ts = pd.to_datetime(published_at).replace(tzinfo=timezone.utc)
-        except Exception:
-            ts = pd.NaT
-
+        try: ts = pd.to_datetime(published_at).replace(tzinfo=timezone.utc)
+        except Exception: ts = pd.NaT
         duration_sec = parse_iso_duration(content.get("duration", ""))
 
         rows.append(
             {
-                "video_id": item.get("id"),
-                "title": snippet.get("title"),
-                "description": snippet.get("description", ""),
-                "channel_title": snippet.get("channelTitle"),
-                "channel_id": snippet.get("channelId"),
-                "published_at": ts,
-                "views": safe_int(stats.get("viewCount")),
-                "likes": safe_int(stats.get("likeCount")),
-                "comments": safe_int(stats.get("commentCount")),
-                "duration_sec": duration_sec,
-                "thumbnail_url": snippet.get("thumbnails", {})
-                .get("medium", {})
-                .get("url", ""),
+                "video_id": item.get("id"), "title": snippet.get("title"), "description": snippet.get("description", ""),
+                "channel_title": snippet.get("channelTitle"), "channel_id": snippet.get("channelId"), "published_at": ts,
+                "views": safe_int(stats.get("viewCount")), "likes": safe_int(stats.get("likeCount")), "comments": safe_int(stats.get("commentCount")),
+                "duration_sec": duration_sec, "thumbnail_url": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
             }
         )
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
+    if df.empty: return df
     now = datetime.now(timezone.utc)
     df["days_since_publish"] = (now - df["published_at"]).dt.total_seconds() / (3600 * 24)
     df["days_since_publish"] = df["days_since_publish"].replace(0, 0.1)
@@ -174,9 +231,7 @@ def fetch_videos_by_keyword(api_key: str, keyword: str, max_results: int) -> pd.
     df["duration_min"] = df["duration_sec"] / 60
     df["weekday"] = df["published_at"].apply(weekday_kr_from_ts)
     df["publish_hour"] = df["published_at"].dt.hour
-
     df["max_watch_time_min"] = df["duration_min"] * df["views"]
-
     return df.sort_values("views", ascending=False).reset_index(drop=True)
 
 
@@ -185,28 +240,20 @@ def fetch_channel_basic(api_key: str, channel_id: str) -> Dict:
     # (기존 코드와 동일하게 유지)
     youtube = build_youtube(api_key)
     resp = youtube.channels().list(
-        part="snippet,statistics,contentDetails",
-        id=channel_id,
-        maxResults=1,
+        part="snippet,statistics,contentDetails", id=channel_id, maxResults=1,
     ).execute()
 
     items = resp.get("items", [])
-    if not items:
-        return {}
+    if not items: return {}
 
     item = items[0]
-    stats = item.get("statistics", {})
-    snippet = item.get("snippet", {})
+    stats = item.get("statistics", {}); snippet = item.get("snippet", {})
 
     return {
-        "channel_id": item.get("id"),
-        "title": snippet.get("title"),
-        "description": snippet.get("description", ""),
+        "channel_id": item.get("id"), "title": snippet.get("title"), "description": snippet.get("description", ""),
         "published_at": pd.to_datetime(snippet.get("publishedAt")).replace(tzinfo=timezone.utc),
-        "subscriber_count": safe_int(stats.get("subscriberCount")),
-        "video_count": safe_int(stats.get("videoCount")),
-        "view_count": safe_int(stats.get("viewCount")),
-        "thumbnail_url": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+        "subscriber_count": safe_int(stats.get("subscriberCount")), "video_count": safe_int(stats.get("videoCount")),
+        "view_count": safe_int(stats.get("viewCount")), "thumbnail_url": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
     }
 
 
@@ -214,62 +261,39 @@ def fetch_channel_basic(api_key: str, channel_id: str) -> Dict:
 def fetch_channel_recent_videos(
     api_key: str, channel_id: str, max_results: int
 ) -> pd.DataFrame:
-    # (기존 코드와 동일하게 유지) - 쿼터 절약 로직이 잘 적용되어 있습니다.
+    # (기존 코드와 동일하게 유지)
     youtube = build_youtube(api_key)
-
     max_results = max(1, min(max_results, 50))
     search_resp = youtube.search().list(
-        part="snippet",
-        channelId=channel_id,
-        type="video",
-        order="date",
-        maxResults=max_results,
+        part="snippet", channelId=channel_id, type="video", order="date", maxResults=max_results,
     ).execute()
 
     video_ids = [item["id"]["videoId"] for item in search_resp.get("items", [])]
-    if not video_ids:
-        return pd.DataFrame()
+    if not video_ids: return pd.DataFrame()
 
     videos_resp = youtube.videos().list(
-        part="snippet,contentDetails,statistics",
-        id=",".join(video_ids),
-        maxResults=len(video_ids),
+        part="snippet,contentDetails,statistics", id=",".join(video_ids), maxResults=len(video_ids),
     ).execute()
 
     rows = []
     for item in videos_resp.get("items", []):
-        snippet = item.get("snippet", {})
-        stats = item.get("statistics", {})
-        content = item.get("contentDetails", {})
-
+        snippet = item.get("snippet", {}); stats = item.get("statistics", {}); content = item.get("contentDetails", {})
         published_at = snippet.get("publishedAt")
-        try:
-            ts = pd.to_datetime(published_at).replace(tzinfo=timezone.utc)
-        except Exception:
-            ts = pd.NaT
-
+        try: ts = pd.to_datetime(published_at).replace(tzinfo=timezone.utc)
+        except Exception: ts = pd.NaT
         duration_sec = parse_iso_duration(content.get("duration", ""))
 
         rows.append(
             {
-                "video_id": item.get("id"),
-                "title": snippet.get("title"),
-                "description": snippet.get("description", ""),
-                "published_at": ts,
-                "views": safe_int(stats.get("viewCount")),
-                "likes": safe_int(stats.get("likeCount")),
-                "comments": safe_int(stats.get("commentCount")),
-                "duration_sec": duration_sec,
-                "thumbnail_url": snippet.get("thumbnails", {})
-                .get("medium", {})
-                .get("url", ""),
+                "video_id": item.get("id"), "title": snippet.get("title"), "description": snippet.get("description", ""),
+                "published_at": ts, "views": safe_int(stats.get("viewCount")), "likes": safe_int(stats.get("likeCount")),
+                "comments": safe_int(stats.get("commentCount")), "duration_sec": duration_sec,
+                "thumbnail_url": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
             }
         )
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
+    if df.empty: return df
     now = datetime.now(timezone.utc)
     df["days_since_publish"] = (now - df["published_at"]).dt.total_seconds() / (3600 * 24)
     df["days_since_publish"] = df["days_since_publish"].replace(0, 0.1)
@@ -278,44 +302,24 @@ def fetch_channel_recent_videos(
     df["weekday"] = df["published_at"].apply(weekday_kr_from_ts)
     df["publish_hour"] = df["published_at"].dt.hour
     df["max_watch_time_min"] = df["duration_min"] * df["views"]
-
     return df.sort_values("published_at", ascending=False).reset_index(drop=True)
 
 
 # ----------------------------
-# SEO / 키워드 분석 (기존 함수 그대로 사용)
+# SEO / 키워드 분석
 # ----------------------------
 
 def extract_keywords_from_titles(titles: List[str], top_n: int = 30) -> pd.DataFrame:
     # (기존 코드와 동일하게 유지)
     joined = " ".join(titles).lower()
     tokens = re.findall(r"[가-힣a-zA-Z0-9]+", joined)
-
     stopwords = {
-        "영상",
-        "official",
-        "video",
-        "the",
-        "and",
-        "for",
-        "with",
-        "full",
-        "ver",
-        "episode",
-        "ep",
-        "live",
-        "tv",
-        "show",
-        "channel",
-        "shorts",
+        "영상", "official", "video", "the", "and", "for", "with", "full", "ver",
+        "episode", "ep", "live", "tv", "show", "channel", "shorts",
     }
-
     filtered = [t for t in tokens if len(t) >= 2 and t not in stopwords]
     counts = Counter(filtered)
-
-    if not counts:
-        return pd.DataFrame(columns=["keyword", "count"])
-
+    if not counts: return pd.DataFrame(columns=["keyword", "count"])
     data = pd.DataFrame(
         [{"keyword": k, "count": v} for k, v in counts.most_common(top_n)]
     )
@@ -323,465 +327,12 @@ def extract_keywords_from_titles(titles: List[str], top_n: int = 30) -> pd.DataF
 
 
 def render_keyword_suggestions(df: pd.DataFrame):
+    # (기존 코드와 동일하게 유지)
     st.subheader("🔍 SEO 키워드/태그 아이디어")
-
-    if df.empty:
-        st.info("분석할 영상이 없습니다.")
-        return
-
+    if df.empty: st.info("분석할 영상이 없습니다."); return
     kw_df = extract_keywords_from_titles(df["title"].tolist(), top_n=30)
-    if kw_df.empty:
-        st.info("추출된 키워드가 거의 없습니다. 제목 패턴이 너무 단순할 수 있습니다.")
-        return
+    if kw_df.empty: st.info("추출된 키워드가 거의 없습니다. 제목 패턴이 너무 단순할 수 있습니다."); return
 
     col1, col2 = st.columns([2, 1])
-
     with col1:
-        st.markdown("**제목에서 자주 등장하는 단어 TOP 30**")
-        st.dataframe(kw_df, use_container_width=True, hide_index=True)
-
-    with col2:
-        st.markdown("**태그로 써볼 만한 후보**")
-        tag_candidates = kw_df.query("count >= 2")["keyword"].tolist()[:15]
-        st.code(", ".join(tag_candidates), language="text")
-
-        st.caption("※ 단순 빈도 기준이므로 실제 검색량/경쟁도와는 다를 수 있습니다.")
-
-
-# ----------------------------
-# 요약 메시지 생성 (룰 기반) - 기존 함수 그대로 사용
-# ----------------------------
-
-def make_simple_summary_for_channel(df: pd.DataFrame) -> str:
-    # (기존 코드와 동일하게 유지)
-    if df.empty:
-        return "최근 영상 데이터가 없어 패턴을 분석할 수 없습니다."
-
-    n = len(df)
-    avg_views = int(df["views"].mean())
-    median_views = int(df["views"].median())
-    max_views = int(df["views"].max())
-
-    # 길이 관련
-    short = df[df["duration_min"] <= 8]
-    long = df[df["duration_min"] >= 20]
-
-    parts = []
-    parts.append(f"최근 {n}개 영상 기준으로 평균 조회수는 약 {avg_views:,}회, 중앙값은 {median_views:,}회입니다.")
-    parts.append(f"가장 많이 본 영상은 약 {max_views:,}회까지 기록했습니다.")
-
-    if not short.empty and not long.empty:
-        short_avg = int(short["views"].mean())
-        long_avg = int(long["views"].mean())
-        if short_avg > long_avg * 1.3:
-            parts.append(
-                f"8분 이하 짧은 영상의 평균 조회수가 {short_avg:,}회로, 20분 이상 긴 영상({long_avg:,}회)보다 꽤 잘 나오는 편입니다. "
-                "짧은 길이의 콘텐츠 비중을 조금 더 늘려보는 것도 좋겠습니다."
-            )
-        elif long_avg > short_avg * 1.3:
-            parts.append(
-                f"20분 이상 긴 영상의 평균 조회수가 {long_avg:,}회로, 8분 이하 영상({short_avg:,}회)보다 유리합니다. "
-                "깊이 있는 장편 콘텐츠가 채널에 잘 맞는 편으로 보입니다."
-            )
-
-    # 요일 패턴
-    weekday_mean = df.groupby("weekday")["views"].mean().sort_values(ascending=False)
-    if len(weekday_mean) >= 3:
-        best_day = weekday_mean.index[0]
-        parts.append(
-            f"요일별 평균 조회수는 **{best_day}요일 업로드분**이 가장 높게 나타납니다. "
-            "해당 요일 전후로 중요한 영상을 배치하는 전략을 고려해볼 만합니다."
-        )
-
-    return "\n\n".join(parts)
-
-
-# ----------------------------
-# 화면 구성 함수들 (UPGRADE: st.metric 활용 강화)
-# ----------------------------
-
-def render_channel_kpi_cards(info: Dict, df: pd.DataFrame):
-    """
-    UPGRADE: 채널 분석 페이지 상단에 구독자, 총 조회수, 평균 조회수, 성장률을 보여주는 KPI 카드 4개 배치
-    """
-    st.markdown("### 🏆 채널 핵심 지표 (Channel KPIs)")
-    
-    # 1. 성장률 계산 (임시: 최근 5개 영상의 일 평균 조회수가 전체 채널 일 평균 조회수 대비 얼마나 증가했는지)
-    # 실제 성장률 계산을 위해서는 시계열 데이터 저장이 필요하지만, UI를 위해 가상의 델타(Delta) 값을 계산합니다.
-    
-    # 채널 개설일로부터 현재까지의 일수
-    days_since_start = (datetime.now(timezone.utc) - info["published_at"]).total_seconds() / (3600 * 24)
-    channel_avg_views_per_day = info["view_count"] / max(days_since_start, 1)
-
-    recent_avg_views_per_day = df["views_per_day"].mean() if not df.empty else 0
-    
-    # 성장률 델타 (채널 전체 vs 최근 영상 성과 비교)
-    growth_delta = 0.0
-    if channel_avg_views_per_day > 0:
-        growth_delta = ((recent_avg_views_per_day - channel_avg_views_per_day) / channel_avg_views_per_day) * 100
-        
-    growth_str = f"{growth_delta:.1f}%"
-    
-    # 카드 4개 배치 (col1, col2: 채널 영구 지표, col3, col4: 최근 영상 성과 지표)
-    col1, col2, col3, col4 = st.columns(4)
-
-    # 1. 구독자
-    col1.metric(
-        label="⭐ 구독자", 
-        value=format_korean_unit(info["subscriber_count"]),
-        delta=f"총 영상 수: {info['video_count']:,}",
-        delta_color="off" # 델타를 다른 용도로 사용
-    )
-    
-    # 2. 총 조회수
-    col2.metric(
-        label="🌐 총 조회수", 
-        value=format_korean_unit(info["view_count"]),
-        delta=f"개설일: {info['published_at'].strftime('%Y.%m.%d')}",
-        delta_color="off"
-    )
-
-    # 3. 최근 평균 조회수
-    col3.metric(
-        label=f"📊 최근 평균 조회수 (영상 {len(df)}개)", 
-        value=f"{int(df['views'].mean()):,}" if not df.empty else "N/A",
-        delta=f"중앙값: {int(df['views'].median()):,}" if not df.empty else "",
-        delta_color="off"
-    )
-
-    # 4. 일일 성과 변화율 (최근 영상이 채널 평균 대비 얼마나 잘 나오는지)
-    col4.metric(
-        label="🚀 일일 성과 변화율 (최근 30일 기준)", 
-        value=f"{int(recent_avg_views_per_day):,}회/일",
-        delta=growth_str,
-        delta_color="inverse" if growth_delta < 0 else "normal"
-    )
-
-def render_basic_stats_cards_for_videos(df: pd.DataFrame, title: str):
-    """
-    UPGRADE: 키워드 분석 페이지의 기본 통계 카드를 깔끔하게 재구성
-    """
-    st.subheader(title)
-
-    if df.empty:
-        st.info("표시할 데이터가 없습니다.")
-        return
-
-    # 카드 3개만 배치하고, 이론상 최대 시청시간은 caption으로 내립니다.
-    total_views = int(df["views"].sum())
-    avg_views = int(df["views"].mean())
-    median_views = int(df["views"].median())
-    total_max_watch_min = int(df["max_watch_time_min"].sum())
-    
-    col1, col2, col3 = st.columns(3)
-    
-    col1.metric("영상 수", f"{len(df):,}")
-    col2.metric("총 조회수", f"{total_views:,}")
-    col3.metric("평균 조회수", f"{avg_views:,}")
-    
-    st.caption(f"※ 분석된 영상의 중앙값 조회수는 {median_views:,}회이며, 이론상 최대 시청시간은 {total_max_watch_min:,}분입니다. ")
-
-
-def render_video_table(df: pd.DataFrame):
-    # (기존 코드와 동일하게 유지)
-    if df.empty:
-        return
-
-    show_cols = [
-        "title",
-        "channel_title", # 키워드 분석 시 채널명을 표시하도록 추가
-        "views",
-        "views_per_day",
-        "duration_min",
-        "weekday",
-        "publish_hour",
-        "published_at",
-    ]
-    rename = {
-        "title": "제목",
-        "channel_title": "채널명",
-        "views": "조회수",
-        "views_per_day": "일 평균 조회수",
-        "duration_min": "길이(분)",
-        "weekday": "요일",
-        "publish_hour": "업로드 시간(시)",
-        "published_at": "업로드 일시",
-    }
-
-    st.markdown("#### 📋 상세 영상 리스트")
-    st.dataframe(
-        df[[c for c in show_cols if c in df.columns]].rename(columns=rename),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# render_pattern_charts, render_top_thumbnails, make_simple_summary_for_channel 
-# 등 다른 함수들은 내용 변경 없이 기존 로직 그대로 사용합니다.
-
-
-# ----------------------------
-# 각 분석 모드 렌더링 (UPGRADE: UI 정리)
-# ----------------------------
-
-def page_keyword_trend(api_key: str, video_limit: int):
-    st.title("🎯 키워드 트렌드 분석")
-    st.markdown("##### 현재 검색 키워드를 중심으로 유튜브 트렌드를 분석합니다.")
-
-    # 입력창을 상단에 고정
-    keyword = st.text_input("분석할 키워드를 입력하세요 (예: 시니어 쇼핑, 건강, 요리 등)", key="kw_input")
-    st.caption(f"※ 가져올 영상 수: {video_limit}개. API 할당량 소모에 주의하세요.")
-
-    if not keyword:
-        st.info("왼쪽 상단에 키워드를 입력한 뒤 Enter 를 눌러주세요.")
-        return
-
-    # 버튼 제거 - Enter 로 바로 실행하도록 유도 (UX 개선)
-    # st.button("🔍 키워드 분석 실행", type="primary")
-
-    try:
-        with st.spinner(f"키워드 '{keyword}' 관련 YouTube 데이터 불러오는 중..."):
-            df = fetch_videos_by_keyword(api_key, keyword, video_limit)
-    except HttpError as e:
-        msg = str(e)
-        if "quotaExceeded" in msg:
-            st.error("❌ YouTube API 일일 할당량이 초과되었습니다. 내일 다시 시도하거나, 가져올 영상 수를 줄여 주세요.")
-        elif "keyInvalid" in msg:
-            st.error("❌ YouTube API 키가 유효하지 않습니다. 키를 다시 확인해 주세요.")
-        else:
-            st.error(f"API 호출 중 오류가 발생했습니다: {msg}")
-        return
-
-    if df.empty:
-        st.warning("검색된 영상이 없습니다.")
-        return
-
-    st.markdown("---") # UI 구분선
-    
-    render_basic_stats_cards_for_videos(df, f"'{keyword}' 관련 영상 요약")
-    
-    st.markdown("---")
-    
-    render_top_thumbnails(df)
-    
-    st.markdown("---")
-    
-    c_chart, c_seo = st.columns([3, 2])
-    
-    with c_chart:
-        render_pattern_charts(df)
-        
-    with c_seo:
-        render_keyword_suggestions(df)
-        
-    st.markdown("---")
-    render_video_table(df)
-
-
-def page_single_channel(api_key: str, video_limit: int):
-    st.title("🎯 특정 채널 심층 분석")
-    st.markdown("##### 채널의 기본 지표, 최근 영상 패턴, SEO 전략을 분석합니다.")
-
-    # 입력창을 상단에 고정
-    raw_input = st.text_input(
-        "채널 ID 또는 채널 URL을 입력하세요",
-        key="ch_input",
-        help="UC 로 시작하는 ID, 또는 https://www.youtube.com/channel/ 형태를 입력하세요.",
-    )
-
-    if not raw_input:
-        st.info("분석할 채널을 입력해 주세요.")
-        return
-
-    channel_id = extract_channel_id(raw_input)
-
-    # 버튼 제거 - Enter 로 바로 실행하도록 유도 (UX 개선)
-    # st.button("📊 채널 분석 실행", type="primary")
-
-    try:
-        with st.spinner("채널/영상 데이터 수집 중..."):
-            info = fetch_channel_basic(api_key, channel_id)
-            df = fetch_channel_recent_videos(api_key, channel_id, video_limit)
-    except HttpError as e:
-        # (기존 오류 처리 로직 유지)
-        msg = str(e)
-        if "quotaExceeded" in msg:
-            st.error("❌ YouTube API 일일 할당량이 초과되었습니다. 내일 다시 시도하거나, 가져올 영상 수를 줄여 주세요.")
-        elif "keyInvalid" in msg:
-            st.error("❌ YouTube API 키가 유효하지 않습니다. 키를 다시 확인해 주세요.")
-        else:
-            st.error(f"API 호출 중 오류가 발생했습니다: {msg}")
-        return
-
-    if not info:
-        st.error("채널 정보를 가져오지 못했습니다. 채널 ID/URL을 다시 확인해 주세요.")
-        return
-
-    # 1. 채널 헤더 (썸네일 + 기본 정보)
-    st.markdown("---")
-    c1, c2 = st.columns([1, 4])
-    with c1:
-        if info.get("thumbnail_url"):
-            st.image(info["thumbnail_url"], caption="채널 썸네일", use_column_width=True)
-    with c2:
-        st.markdown(f"## 📺 {info['title']}")
-        st.caption(f"**ID**: {info['channel_id']} | **개설일**: {info['published_at'].strftime('%Y년 %m월 %d일')}")
-        st.markdown(info.get("description", "")[:250].replace('\n', ' ') + "...")
-
-    st.markdown("---")
-    
-    # 2. KPI 카드 (업그레이드된 함수 사용)
-    render_channel_kpi_cards(info, df)
-
-    st.markdown("---")
-
-    # 3. 인사이트 및 패턴 분석
-    st.subheader("🧠 채널 운영 인사이트 (룰 기반 요약)")
-    st.info(make_simple_summary_for_channel(df))
-    
-    st.markdown("---")
-
-    render_top_thumbnails(df)
-    render_pattern_charts(df)
-    render_keyword_suggestions(df)
-    render_video_table(df)
-
-
-def page_competitive_channels(api_key: str, video_limit: int):
-    # (기존 코드와 동일하게 유지) - 추후 5단계에서 강화
-    st.title("🎯 경쟁 채널 벤치마킹")
-    st.markdown("##### 비슷한 주제의 채널 여러 개를 비교하여 벤치마킹합니다.")
-    # ... (기존 경쟁 채널 함수 내용) ...
-    st.write(
-        "비슷한 주제의 채널 여러 개를 넣어두고, 최근 영상 성과를 간단히 비교해볼 수 있습니다.\n"
-        "각 줄에 하나씩 채널 ID 또는 URL 을 적어 주세요."
-    )
-
-    raw = st.text_area(
-        "채널 ID / URL 목록 (한 줄에 하나씩)",
-        height=150,
-        placeholder="예)\nhttps://www.youtube.com/channel/UCxxxxxxxxxx1\nhttps://www.youtube.com/channel/UCxxxxxxxxxx2",
-        key="comp_input"
-    )
-
-    if not raw.strip():
-        st.info("채널 목록을 입력해 주세요.")
-        return
-
-    lines = [extract_channel_id(line) for line in raw.splitlines() if line.strip()]
-    lines = list(dict.fromkeys(lines))  # 중복 제거
-
-    if len(lines) < 2:
-        st.info("최소 2개 이상의 채널을 입력해 주세요.")
-        return
-
-    if st.button("📊 경쟁 채널 비교 실행", type="primary"):
-        rows = []
-        error_channels = []
-
-        for cid in lines:
-            try:
-                with st.spinner(f"채널 {cid} 분석 중..."):
-                    info = fetch_channel_basic(api_key, cid)
-                    df = fetch_channel_recent_videos(api_key, cid, video_limit)
-            except HttpError as e:
-                msg = str(e)
-                if "quotaExceeded" in msg:
-                    st.error("❌ YouTube API 일일 할당량이 초과되었습니다. 더 이상 채널을 분석할 수 없습니다.")
-                    return
-                else:
-                    error_channels.append(f"{cid} (오류: {msg})")
-                    continue
-
-            if not info or df.empty:
-                error_channels.append(f"{cid} (데이터 없음)")
-                continue
-
-            row = {
-                "채널명": info["title"],
-                "채널ID": info["channel_id"],
-                "구독자 수": info["subscriber_count"],
-                "총 조회수": info["view_count"],
-                "총 업로드 수": info["video_count"],
-                "최근 영상 수(분석)": len(df),
-                "최근 평균 조회수": int(df["views"].mean()),
-                "최근 중앙값 조회수": int(df["views"].median()),
-                "최근 최고 조회수": int(df["views"].max()),
-                "최근 평균 길이(분)": round(df["duration_min"].mean(), 1),
-                "최근 일 평균 조회수(평균)": int(df["views_per_day"].mean()),
-            }
-            rows.append(row)
-
-        if not rows:
-            st.error("성공적으로 분석된 채널이 없습니다.")
-            if error_channels:
-                st.write("오류 채널 목록:")
-                st.write("\n".join(error_channels))
-            return
-
-        result_df = pd.DataFrame(rows)
-        st.subheader("🏁 경쟁 채널 요약 비교 테이블")
-        st.dataframe(result_df, use_container_width=True, hide_index=True)
-
-        st.subheader("📈 채널별 최근 평균 조회수 비교")
-        st.bar_chart(result_df.set_index("채널명")["최근 평균 조회수"])
-
-        st.subheader("📈 채널별 최근 일 평균 조회수(영상 1개 기준) 비교")
-        st.bar_chart(result_df.set_index("채널명")["최근 일 평균 조회수(평균)"])
-
-        if error_channels:
-            with st.expander("⚠ 분석 실패/데이터 부족 채널 보기"):
-                st.write("\n".join(error_channels))
-
-
-# ----------------------------
-# 메인
-# ----------------------------
-
-def main():
-    api_key = get_api_key()
-    if not api_key:
-        st.stop()
-
-    # 왼쪽 사이드바 - 분석 모드 & 공통 옵션
-    st.sidebar.header("🔎 분석 모드 선택")
-
-    mode = st.sidebar.radio(
-        "분석 대상",
-        ["특정 채널 심층 분석", "키워드 트렌드 분석", "경쟁 채널 벤치마킹"], # 채널 분석을 기본으로
-        index=0,
-    )
-
-    st.sidebar.markdown("---")
-    # UPGRADE: 영상 개수 조절 슬라이더는 그대로 유지 (min_value=5, max_value=30)
-    video_limit = st.sidebar.slider(
-        "가져올 영상 개수 (1회 분석당)",
-        min_value=5,
-        max_value=30,
-        value=10,
-        help="값이 클수록 분석은 풍부해지지만, YouTube API 일일 할당량이 더 빨리 소모됩니다. 5~15 권장.",
-    )
-
-    st.sidebar.markdown("---")
-    # UPGRADE: Quota 절약 안내 메시지 강조
-    st.sidebar.markdown(
-        """
-        ### 🚨 API 쿼터 절약 가이드
-        - **추천값 유지**: 영상 개수는 **5~15개** 정도로 유지하세요.
-        - **캐시 활용**: 동일한 채널/키워드는 1시간 동안 API를 재사용하지 않습니다.
-        - **초과 시**: 쿼터는 매일 자동으로 초기화됩니다.
-        """
-    )
-    
-    st.markdown("---") # 대시보드 메인 페이지 상단에 구분선 추가
-
-    if mode == "키워드 트렌드 분석":
-        page_keyword_trend(api_key, video_limit)
-    elif mode == "특정 채널 심층 분석":
-        page_single_channel(api_key, video_limit)
-    elif mode == "경쟁 채널 벤치마킹":
-        page_competitive_channels(api_key, video_limit)
-
-
-if __name__ == "__main__":
-    main()
+        st.markdown("**제목에서 자주 등장하는 단어 TOP
