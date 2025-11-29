@@ -1,3 +1,6 @@
 streamlit
 google-api-python-client
 pandas
+numpy
+isodate
+plotly
